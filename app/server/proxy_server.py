@@ -277,7 +277,12 @@ class ProxyServer:
         return False  # 不是待处理的请求，继续处理
 
     async def check_account_online_status(self, account_id: int) -> bool:
-        """通过向连接发送get_status API检查账号是否在线"""
+        """通过向连接发送 get_login_info 检查账号 QQ 是否实际登录。
+
+        ★ 大修：改用 get_login_info 替代 get_status。
+        get_status.data.online 仅反映 NapCat 进程健康状态，QQ 掉线后仍为 True（假阳性）。
+        get_login_info 返回 user_id=0/"" 表示 QQ 未登录，是唯一可靠的登录检测方式。
+        """
         echo = None
         try:
             matched_connection = None
@@ -290,27 +295,27 @@ class ProxyServer:
                 self.logger.ws.debug(f"账号{account_id}没有匹配的连接，返回离线")
                 return False
 
-            echo = f"status_check_{account_id}_{int(datetime.now().timestamp())}"
+            echo = f"login_check_{account_id}_{int(datetime.now().timestamp())}"
 
             future = asyncio.Future()
             self.pending_api_requests[echo] = future
 
-            get_status_request = {
-                "action": "get_status",
+            get_login_info_request = {
+                "action": "get_login_info",
                 "params": {},
                 "echo": echo
             }
 
-            request_json = json.dumps(get_status_request, ensure_ascii=False)
+            request_json = json.dumps(get_login_info_request, ensure_ascii=False)
             await matched_connection.client_ws.send(request_json)
 
             try:
                 response = await asyncio.wait_for(future, timeout=5.0)
-                self.logger.ws.debug(f"账号{account_id}收到get_status响应: {json.dumps(response, ensure_ascii=False)}")
-                if isinstance(response, dict):
-                    online = response.get("data", {}).get("online")
-                    # 根据OneBot v11文档，get_status返回的data.online字段为true表示在线
-                    return online == True
+                self.logger.ws.debug(f"账号{account_id}收到get_login_info响应: {json.dumps(response, ensure_ascii=False)}")
+                if isinstance(response, dict) and response.get("status") == "ok":
+                    data = response.get("data", {})
+                    user_id = str(data.get("user_id", data.get("uin", "")))
+                    return bool(user_id) and user_id != "0"
                 return False
             except asyncio.TimeoutError:
                 self.logger.ws.warning(f"检查账号{account_id}在线状态超时")
