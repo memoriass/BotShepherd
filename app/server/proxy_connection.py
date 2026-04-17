@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import time as _time
 import websockets
 import json
 from datetime import datetime
@@ -50,6 +51,12 @@ class ProxyConnection:
         self.reconnect_locks = []  # 每个 target_index 一个 Lock
         for _ in self.config.get("target_endpoints", []):
             self.reconnect_locks.append(asyncio.Lock())
+
+        # ── QQ 登录状态监控 ──
+        self._pending_login_checks: dict = {}   # echo -> asyncio.Future
+        self._qq_logged_in: bool | None = None  # BS 侧缓存的 QQ 登录态
+        self._login_monitor_task: asyncio.Task | None = None
+        _LOGIN_CHECK_INTERVAL = 60              # 秒
 
         # 初始化消息处理器
         self.message_processor = MessageProcessor(config_manager, database_manager, logger)
@@ -107,6 +114,11 @@ class ProxyConnection:
                     tasks.append(asyncio.create_task(
                         self._forward_target_to_client(target_ws, self.list_index2target_index(idx))
                     ))
+
+            # ★ 启动 QQ 登录状态后台监控（仅保活模式）
+            if self.target_keepalive_enabled and self.manager_target_indexes:
+                self._login_monitor_task = asyncio.create_task(self._login_monitor_loop())
+                tasks.append(self._login_monitor_task)
 
             if tasks:
                 # 等待任务，当任意任务结束时（如客户端断开）立即取消其他任务
@@ -349,10 +361,23 @@ class ProxyConnection:
             # 检查是否是API响应（有echo字段）
             if message_data.get("echo"):
                 echo_val = str(message_data["echo"])
+                # ★ 优先检查是否是 BS 内部登录检测的响应
+                if echo_val in self._pending_login_checks:
+                    future = self._pending_login_checks[echo_val]
+                    if not future.done():
+                        future.set_result(message_data)
+                    return  # 内部 API 响应不转发给 target
                 # 调用API响应回调（用于处理待处理的API请求，如在线状态检查）
                 if self.api_response_callback:
                     if self.api_response_callback(echo_val, message_data):
                         return
+
+            # ★ P1: 覆写心跳的 status.online 为 BS 侧真实 QQ 登录态
+            if (message_data.get("meta_event_type") == "heartbeat"
+                    and self._qq_logged_in is not None
+                    and not self._qq_logged_in):
+                if isinstance(message_data.get("status"), dict):
+                    message_data["status"]["online"] = False
 
             # 消息预处理
             message_data = await self.command_handler.preprocesser(message_data)
@@ -563,6 +588,97 @@ class ProxyConnection:
     def list_index2target_index(list_index):
         return list_index + 1
 
+    # ─────────────────────────────────────────────────────────
+    #  QQ 登录状态后台监控 (P1 + P2)
+    # ─────────────────────────────────────────────────────────
+
+    async def _login_monitor_loop(self):
+        """后台周期性检测 QQ 登录状态，状态翻转时推送合成事件。"""
+        await asyncio.sleep(15)  # 初始延迟，等 NapCat 稳定
+        interval = 60
+        while self.running and self.client_alive:
+            try:
+                logged_in = await self._check_qq_login()
+                old = self._qq_logged_in
+                self._qq_logged_in = logged_in
+
+                if old is not None and old != logged_in:
+                    if not logged_in:
+                        self.logger.ws.warning(
+                            f"[{self.connection_id}] QQ 登录状态变化: 在线 → 离线"
+                        )
+                        await self._send_synthetic_bot_offline()
+                    else:
+                        self.logger.ws.info(
+                            f"[{self.connection_id}] QQ 登录状态变化: 离线 → 在线"
+                        )
+                        await self._send_synthetic_lifecycle("connect")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                self.logger.ws.warning(
+                    f"[{self.connection_id}] 登录状态监控异常: {e}"
+                )
+            await asyncio.sleep(interval)
+
+    async def _check_qq_login(self) -> bool:
+        """向 NapCat 发送 get_login_info，返回 QQ 是否登录。"""
+        if not self.client_ws or not self.client_alive:
+            return False
+
+        echo = f"_bs_login_chk_{self.connection_id}_{int(_time.time())}"
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_login_checks[echo] = future
+
+        try:
+            req = json.dumps({
+                "action": "get_login_info",
+                "params": {},
+                "echo": echo,
+            }, ensure_ascii=False)
+            await self.client_ws.send(req)
+
+            response = await asyncio.wait_for(future, timeout=5.0)
+            data = response.get("data", {})
+            user_id = data.get("user_id", data.get("uin", ""))
+            return bool(user_id) and str(user_id) != "0"
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+            return False
+        except Exception:
+            return False
+        finally:
+            self._pending_login_checks.pop(echo, None)
+
+    async def _send_synthetic_bot_offline(self):
+        """向保活的 manager target 推送合成 bot_offline 通知。"""
+        if not self.target_keepalive_enabled:
+            return
+        event = {
+            "time": int(_time.time()),
+            "self_id": self.self_id or 0,
+            "post_type": "notice",
+            "notice_type": "bot_offline",
+            "tag": "qq_logout_detected",
+            "message": "BS login monitor detected QQ logout",
+        }
+        event_json = json.dumps(event, ensure_ascii=False)
+        for idx in self.manager_target_indexes:
+            list_idx = self.target_index2list_index(idx)
+            if list_idx < len(self.target_connections) and self.target_connections[list_idx]:
+                try:
+                    await self.target_connections[list_idx].send(event_json)
+                    self.logger.ws.info(
+                        f"[{self.connection_id}] 已向 target {idx} 推送合成 bot_offline"
+                    )
+                except Exception as e:
+                    self.logger.ws.warning(
+                        f"[{self.connection_id}] 推送合成 bot_offline 到 target {idx} 失败: {e}"
+                    )
+
+    # ─────────────────────────────────────────────────────────
+    #  合成 lifecycle 事件
+    # ─────────────────────────────────────────────────────────
+
     def _build_synthetic_lifecycle(self, sub_type: str) -> str:
         """构造合成 lifecycle 事件 JSON。
 
@@ -604,6 +720,12 @@ class ProxyConnection:
         非保活模式：等同于调用 stop()，client 和 target 全部关闭。
         """
         self.client_alive = False
+        self._qq_logged_in = None  # 重置缓存
+
+        # ★ 停止登录监控任务
+        if self._login_monitor_task and not self._login_monitor_task.done():
+            self._login_monitor_task.cancel()
+            self._login_monitor_task = None
 
         # ★ 向保活的 manager target 推送合成 disconnect 事件
         await self._send_synthetic_lifecycle("disconnect")
