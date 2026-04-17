@@ -191,12 +191,13 @@ class ProxyServer:
                         old_conn = self.active_connections[connection_id]
                         old_ws = old_conn.client_ws
 
-                        # 检查旧连接是否真的还活着 - 使用 state 属性
+                        # 保活模式下旧 ProxyConnection 可能还在（target 独立运行），
+                        # 此时判断"活着"只看 client_alive + ws 状态，不看 runtime 是否存在
                         old_state = getattr(old_ws, 'state', None) if old_ws else None
-                        is_old_alive = old_ws and old_state == 1  # 1 = OPEN 状态
+                        is_old_alive = old_conn.client_alive and old_ws and old_state == 1
 
                         if is_old_alive:
-                            # 旧连接还活着，拒绝新连接（防止频繁重连）
+                            # 旧 client 连接真的还活着，拒绝新连接（防止频繁重连）
                             old_ip = getattr(old_ws, 'remote_address', 'unknown')
                             new_ip = getattr(ws, 'remote_address', 'unknown')
                             self.logger.ws.warning(
@@ -205,9 +206,15 @@ class ProxyServer:
                             await ws.close(1008, "Connection already exists")
                             return
                         else:
-                            # 旧连接已死但还在字典中，清理它
-                            self.logger.ws.info(f"[{connection_id}] 清理已断开的旧连接")
-                            del self.active_connections[connection_id]
+                            # 旧 client 已断（可能处于 target 保活状态），允许新 client 复用 runtime
+                            if old_conn.target_keepalive_enabled:
+                                self.logger.ws.info(
+                                    f"[{connection_id}] 旧 client 已断但 target 保活中，新 client 接管 runtime"
+                                )
+                                # 不删 active_connections，由 _handle_client_connection 更新 client_ws
+                            else:
+                                self.logger.ws.info(f"[{connection_id}] 清理已断开的旧连接")
+                                del self.active_connections[connection_id]
 
                     return await self._handle_client_connection(ws, path, connection_id, config)
 
@@ -320,36 +327,44 @@ class ProxyServer:
         """处理客户端连接"""
         client_ip = client_ws.remote_address
         self.logger.ws.info(f"[{connection_id}] 新的客户端连接: {client_ip}")
-        
-        try:
-            # 创建代理连接对象
-            proxy_connection = ProxyConnection(
-                connection_id=connection_id,
-                config=config,
-                client_ws=client_ws,
-                config_manager=self.config_manager,
-                database_manager=self.database_manager,
-                logger=self.logger,
-                backup_manager=self.backup_manager,
-                status_callback=lambda key, value: self._update_connection_status(connection_id, key, value),
-                api_response_callback=self._handle_api_response
-            )
-            
-            # 保存活动连接
-            self.active_connections[connection_id] = proxy_connection
 
-            # 启动代理
+        try:
+            # 判断是否有保活中的旧 runtime 可以复用
+            existing = self.active_connections.get(connection_id)
+            if existing and existing.target_keepalive_enabled and not existing.client_alive:
+                # 旧 runtime 保活中：直接更新 client_ws，不新建 ProxyConnection
+                proxy_connection = existing
+                proxy_connection.client_ws = client_ws
+                self.logger.ws.info(f"[{connection_id}] 复用保活 runtime，接管新 client: {client_ip}")
+            else:
+                # 正常情况：新建 ProxyConnection
+                proxy_connection = ProxyConnection(
+                    connection_id=connection_id,
+                    config=config,
+                    client_ws=client_ws,
+                    config_manager=self.config_manager,
+                    database_manager=self.database_manager,
+                    logger=self.logger,
+                    backup_manager=self.backup_manager,
+                    status_callback=lambda key, value: self._update_connection_status(connection_id, key, value),
+                    api_response_callback=self._handle_api_response,
+                )
+                self.active_connections[connection_id] = proxy_connection
+
+            # 启动代理（保活模式下 target 已连，只重跑 client 侧）
             await proxy_connection.start_proxy()
 
             # 代理结束后，保存账号ID到状态中
             if proxy_connection.self_id and connection_id in self.connection_statuses:
                 self.connection_statuses[connection_id]['self_id'] = proxy_connection.self_id
-            
+
         except Exception as e:
             self.logger.ws.error(f"[{connection_id}] 处理客户端连接失败: {e}")
         finally:
-            # 清理连接
-            if connection_id in self.active_connections:
+            # 保活模式：runtime 留在 active_connections，由 restart/stop 显式清理
+            # 非保活模式：client 断即可删除
+            conn = self.active_connections.get(connection_id)
+            if conn and not conn.target_keepalive_enabled:
                 del self.active_connections[connection_id]
             self.logger.ws.info(f"[{connection_id}] 客户端连接已关闭: {client_ip}")
 

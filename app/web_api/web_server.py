@@ -4,6 +4,7 @@ Web服务器
 """
 
 import asyncio
+import os
 import re
 import time
 import concurrent.futures
@@ -31,7 +32,7 @@ class WebServer:
         self.app = Flask(__name__, 
                         template_folder="../../templates",
                         static_folder="../../static")
-        self.app.secret_key = "botshepherd_secret_key_change_me"
+        self.app.secret_key = os.environ.get("BOTSHEPHERD_SECRET_KEY") or "botshepherd_secret_key_change_me"
         
         # 启用CORS
         CORS(self.app)

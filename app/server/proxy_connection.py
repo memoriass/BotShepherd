@@ -33,9 +33,19 @@ class ProxyConnection:
         self.target_connections = []
         self.echo_cache = {}
         self.running = False
+        self.client_alive = False  # 标记 NapCat client_ws 当前是否在线
         self.client_headers = None
         self.first_message = None
         self.self_id: int | None = None
+
+        # 保活策略：只对自动注入的 manager target 生效，避免影响其他框架
+        self.target_keepalive_enabled = bool(self.config.get("keep_target_alive", False))
+        _target_eps = list(self.config.get("target_endpoints", []))
+        # 识别哪些 target 是管理器接收端点（需要独立保活）
+        self.manager_target_indexes: set = {
+            idx for idx, ep in enumerate(_target_eps, start=1)
+            if "/ws/napcat/" in ep or ep.endswith("/ws/onebot/v11/ws")
+        }
 
         self.reconnect_locks = []  # 每个 target_index 一个 Lock
         for _ in self.config.get("target_endpoints", []):
@@ -50,6 +60,12 @@ class ProxyConnection:
     async def start_proxy(self):
         """启动代理"""
         self.running = True
+        was_reconnect = not self.client_alive and self.target_keepalive_enabled
+        self.client_alive = True  # client_ws 已连入
+
+        # ★ 保活模式下 client 重连，向 manager target 推送合成 connect 事件
+        if was_reconnect:
+            await self._send_synthetic_lifecycle("connect")
 
         try:
             # 等待客户端第一个消息以获取请求头
@@ -114,7 +130,8 @@ class ProxyConnection:
         except Exception as e:
             self.logger.ws.error(f"[{self.connection_id}] 代理运行错误: {e}")
         finally:
-            await self.stop()
+            # client 已离线：标记状态，按保活策略决定是否同时关闭 target
+            await self.on_client_disconnect()
 
 
     async def _connect_to_target(self, endpoint: str, target_index: int):
@@ -182,16 +199,30 @@ class ProxyConnection:
 
 
     async def _connect_to_targets(self):
-        """连接到目标端点"""
+        """连接到目标端点。
+
+        保活 runtime 复用场景：target 可能已经在重连循环中，跳过已连接的 target，
+        只对尚未连接（None）的 target 尝试初始化，避免与后台重连任务竞态。
+        """
         target_endpoints = self.config.get("target_endpoints", [])
 
         # 先标记哪些目标需要启动重连（避免在循环中启动任务）
         failed_targets = []
         for idx, endpoint in enumerate(target_endpoints):
-            target_ws = await self._connect_to_target(endpoint, self.list_index2target_index(idx))
+            target_index = self.list_index2target_index(idx)
+            list_idx = self.target_index2list_index(target_index)
+
+            # 保活 runtime 复用：若该 target 已连接（非 None），跳过避免重复连接
+            if list_idx < len(self.target_connections) and self.target_connections[list_idx] is not None:
+                self.logger.ws.info(
+                    f"[{self.connection_id}] target {target_index} 已连接，跳过重复初始化（保活复用）"
+                )
+                continue
+
+            target_ws = await self._connect_to_target(endpoint, target_index)
             # 如果连接失败（返回 None），记录下来稍后启动重连
             if target_ws is None:
-                failed_targets.append(self.list_index2target_index(idx))
+                failed_targets.append(target_index)
 
         # 在所有连接尝试完成后，启动失败目标的重连任务
         for target_index in failed_targets:
@@ -213,11 +244,24 @@ class ProxyConnection:
         """转发目标消息到客户端"""
         try:
             async for message in target_ws:
-                await self._process_target_message(message, target_index)
+                # client 已离线时跳过回送，但不中止 target 接收循环
+                if not self.client_alive:
+                    self.logger.ws.debug(
+                        f"[{self.connection_id}] client 离线，丢弃来自 target {target_index} 的回送消息"
+                    )
+                    continue
+                try:
+                    await self._process_target_message(message, target_index)
+                except websockets.exceptions.ConnectionClosed:
+                    # client 在此期间断开，标记并继续保持 target 活跃
+                    self.client_alive = False
+                    self.logger.ws.info(
+                        f"[{self.connection_id}] target {target_index} 回送时 client 已断开，target 继续保活"
+                    )
         except websockets.exceptions.ConnectionClosed:
             await self._reconnect_target(target_index)
         except TypeError:
-            await self._reconnect_target(target_index) # 如果是None，也挂一个后台重连
+            await self._reconnect_target(target_index)  # 如果是None，也挂一个后台重连
         except Exception as e:
             self.logger.ws.error(f"[{self.connection_id}] 目标消息转发错误 {target_index}: {e}")
 
@@ -226,6 +270,18 @@ class ProxyConnection:
         await asyncio.sleep(5)
         await self._reconnect_target(target_index)
 
+    def _should_keep_target_alive(self, target_index: int) -> bool:
+        """决定 target 重连是否应该继续。
+
+        manager target（manager_target_indexes 内）在开启保活模式时，
+        client 离线后仍继续重连，其他普通 target 跟随 client 生命周期。
+        """
+        if not self.running:
+            return False
+        if self.target_keepalive_enabled and target_index in self.manager_target_indexes:
+            return True
+        return self.client_alive
+
     async def _reconnect_target(self, target_index: int):
         self.logger.ws.info(f"[{self.connection_id}] 目标连接 {target_index} 已关闭。将在120秒内持续尝试重新连接。")
 
@@ -233,43 +289,48 @@ class ProxyConnection:
         if not lock.locked():
             async with lock:
                 for _ in range(40):
-                    # 检查客户端连接是否还活着 - 使用 state 属性
-                    client_state = getattr(self.client_ws, 'state', None)
-                    if not self.running or client_state != 1:  # 1 = OPEN 状态
-                        self.logger.ws.info(f"[{self.connection_id}] 客户端已断开 (running={self.running}, state={client_state})，停止重连目标 {target_index}")
+                    if not self._should_keep_target_alive(target_index):
+                        self.logger.ws.info(
+                            f"[{self.connection_id}] 停止重连目标 {target_index}"
+                            f"（running={self.running}, client_alive={self.client_alive}）"
+                        )
                         return
 
                     await asyncio.sleep(3)
                     try:
-                        target_ws = await self._connect_to_target(self.config.get("target_endpoints", [])[self.target_index2list_index(target_index)], target_index)
+                        target_ws = await self._connect_to_target(
+                            self.config.get("target_endpoints", [])[self.target_index2list_index(target_index)],
+                            target_index,
+                        )
                         if target_ws is None:
                             continue
-                        await self._process_client_message(self.first_message) # 比如yunzai需要使用first Message重新注册
+                        # 仅当 client 在线且有首包时才 replay，保证 Yunzai 等框架重新注册
+                        if self.client_alive and self.first_message:
+                            await self._process_client_message(self.first_message)
                         self.logger.ws.info(f"[{self.connection_id}] 目标连接 {target_index} 恢复成功，5秒后重新开始转发。")
                         await asyncio.sleep(5)
                         await self._forward_target_to_client(target_ws, target_index)
                     except Exception as e:
                         self.logger.ws.warning(f"[{self.connection_id}] 尝试重连目标 {target_index} 失败: {e}")
 
-                # 长期重连循环
-                while self.running:
-                    # 检查客户端状态
-                    client_state = getattr(self.client_ws, 'state', None)
-                    if client_state != 1:  # 1 = OPEN 状态
-                        break
-
-                    await asyncio.sleep(600) # 10分钟后再试
+                # 长期重连循环（120s 快速重试结束后）
+                while self._should_keep_target_alive(target_index):
+                    await asyncio.sleep(600)  # 10分钟后再试
                     try:
-                        target_ws = await self._connect_to_target(self.config.get("target_endpoints", [])[self.target_index2list_index(target_index)], target_index)
+                        target_ws = await self._connect_to_target(
+                            self.config.get("target_endpoints", [])[self.target_index2list_index(target_index)],
+                            target_index,
+                        )
                         if target_ws:
-                            await self._process_client_message(self.first_message)
+                            if self.client_alive and self.first_message:
+                                await self._process_client_message(self.first_message)
                             self.logger.ws.info(f"[{self.connection_id}] 目标连接 {target_index} 恢复成功，5秒后重新开始转发。")
                             await asyncio.sleep(5)
                             await self._forward_target_to_client(target_ws, target_index)
                     except Exception:
                         pass
 
-                self.logger.ws.info(f"[{self.connection_id}] 客户端已断开，终止目标 {target_index} 的重连循环")
+                self.logger.ws.info(f"[{self.connection_id}] 终止目标 {target_index} 的重连循环")
 
     async def _process_client_message(self, message: str):
         """处理客户端消息"""
@@ -502,24 +563,88 @@ class ProxyConnection:
     def list_index2target_index(list_index):
         return list_index + 1
 
+    def _build_synthetic_lifecycle(self, sub_type: str) -> str:
+        """构造合成 lifecycle 事件 JSON。
+
+        当 NapCat client 断连/重连时，通过保活的 target WS 将此事件
+        注入下游（如 Manager），使其能实时感知上游在线状态变化。
+        """
+        import time
+        event = {
+            "time": int(time.time()),
+            "self_id": self.self_id or 0,
+            "post_type": "meta_event",
+            "meta_event_type": "lifecycle",
+            "sub_type": sub_type,
+        }
+        return json.dumps(event, ensure_ascii=False)
+
+    async def _send_synthetic_lifecycle(self, sub_type: str):
+        """向所有保活中的 manager target 发送合成 lifecycle 事件。"""
+        if not self.target_keepalive_enabled:
+            return
+        event_json = self._build_synthetic_lifecycle(sub_type)
+        for idx in self.manager_target_indexes:
+            list_idx = self.target_index2list_index(idx)
+            if list_idx < len(self.target_connections) and self.target_connections[list_idx]:
+                try:
+                    await self.target_connections[list_idx].send(event_json)
+                    self.logger.ws.info(
+                        f"[{self.connection_id}] 已向 target {idx} 发送合成 lifecycle.{sub_type}"
+                    )
+                except Exception as e:
+                    self.logger.ws.warning(
+                        f"[{self.connection_id}] 发送合成 lifecycle.{sub_type} 到 target {idx} 失败: {e}"
+                    )
+
+    async def on_client_disconnect(self):
+        """NapCat client 断线处理（由 start_proxy finally 调用）。
+
+        保活模式下：只关闭 client_ws，target 连接由后台重连任务独立维护。
+        非保活模式：等同于调用 stop()，client 和 target 全部关闭。
+        """
+        self.client_alive = False
+
+        # ★ 向保活的 manager target 推送合成 disconnect 事件
+        await self._send_synthetic_lifecycle("disconnect")
+
+        # 安全关闭 client 侧 ws
+        if self.client_ws:
+            await self._close_websocket(self.client_ws)
+            self.client_ws = None
+
+        if not self.target_keepalive_enabled:
+            # 无保活需求：一并停止所有 target
+            await self.stop()
+        else:
+            self.logger.ws.info(
+                f"[{self.connection_id}] client 已断开，target 保活模式激活"
+                f"（manager_targets={self.manager_target_indexes}）"
+            )
+
     async def stop(self):
-        """停止代理连接"""
+        """完全停止代理连接（关闭 client + 所有 target）。
+
+        由外部（proxy_server.restart/stop）显式调用，或非保活模式的 on_client_disconnect 调用。
+        """
         self.running = False
+        self.client_alive = False
 
         # 关闭目标连接
         close_tasks = []
         for target_ws in self.target_connections:
             close_tasks.append(asyncio.create_task(self._close_websocket(target_ws)))
 
-        # 关闭客户端连接
+        # 关闭客户端连接（若仍存在）
         if self.client_ws:
             close_tasks.append(asyncio.create_task(self._close_websocket(self.client_ws)))
+            self.client_ws = None
 
         if close_tasks:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*close_tasks, return_exceptions=True),
-                    timeout=3.0  # 3秒超时
+                    timeout=3.0
                 )
             except asyncio.TimeoutError:
                 self.logger.ws.warning(f"[{self.connection_id}] 关闭连接超时")
